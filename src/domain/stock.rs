@@ -1,13 +1,20 @@
-//! 在庫。
+//! 在庫。1 件 = 「ある倉庫にある、ある SKU」。
 //!
 //! 不変条件: `reserved <= on_hand`。
 //! つまり `available = on_hand - reserved` は決してマイナスにならない。
 //! この条件を守るため、フィールドは非公開にしてメソッド経由でしか変更できないようにする。
+//!
+//! on_hand を変えるメソッド(入荷・出荷・棚卸調整)は、受払台帳に載せる
+//! `StockMovement` を戻り値で返す。台帳への記録漏れを、呼び出し側の注意力ではなく
+//! 「戻り値を使わないと警告が出る」という型の仕組みで防ぐため。
 
-use super::{DomainError, Quantity, Shortage, Sku};
+use super::{
+    AdjustmentReason, DomainError, MovementReason, Quantity, Sku, StockMovement, WarehouseId,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stock {
+    warehouse: WarehouseId,
     sku: Sku,
     /// 実在庫(倉庫に物理的にある数)
     on_hand: Quantity,
@@ -16,9 +23,10 @@ pub struct Stock {
 }
 
 impl Stock {
-    /// 在庫 0 の新しい在庫レコードを作る。入荷時に SKU が未登録なら使う。
-    pub fn new(sku: Sku) -> Self {
+    /// 在庫 0 の新しい在庫レコードを作る。入荷時に未登録なら使う。
+    pub fn new(warehouse: WarehouseId, sku: Sku) -> Self {
         Stock {
+            warehouse,
             sku,
             on_hand: Quantity::ZERO,
             reserved: Quantity::ZERO,
@@ -28,6 +36,10 @@ impl Stock {
     // ---- 読み取り ----
     // `&self` は「自分を読み取り専用で借りる」という意味。
     // 呼び出し後も呼び出し元が Stock を使い続けられる。
+
+    pub fn warehouse(&self) -> &WarehouseId {
+        &self.warehouse
+    }
 
     pub fn sku(&self) -> &Sku {
         &self.sku
@@ -48,20 +60,9 @@ impl Stock {
         self.on_hand.saturating_sub(self.reserved)
     }
 
-    /// この在庫で `requested` を引当できないなら、その不足を返す。
-    ///
-    /// 状態を変えずに「できるかどうか」だけを調べる。
-    /// all-or-nothing の引当では、全明細を先にこれで調べてから実際に変更する。
-    pub fn shortage_for(&self, requested: Quantity) -> Option<Shortage> {
-        if self.available() >= requested {
-            None
-        } else {
-            Some(Shortage {
-                sku: self.sku.clone(),
-                requested,
-                available: self.available(),
-            })
-        }
+    /// 倉庫と SKU が一致するか。在庫の一覧から目的の 1 件を探すときに使う。
+    pub fn is(&self, warehouse: &WarehouseId, sku: &Sku) -> bool {
+        &self.warehouse == warehouse && &self.sku == sku
     }
 
     // ---- 変更 ----
@@ -69,7 +70,11 @@ impl Stock {
     // Rust では同時に 1 か所しか `&mut` で借りられないので、データ競合がコンパイル時に防がれる。
 
     /// 入荷。実在庫を増やす。
-    pub fn receive(&mut self, quantity: Quantity) -> Result<(), DomainError> {
+    ///
+    /// `#[must_use]` を付けると、戻り値を捨てたときにコンパイラが警告する。
+    /// 台帳への記録漏れを防ぐため。
+    #[must_use = "受払台帳に記録すること"]
+    pub fn receive(&mut self, quantity: Quantity) -> Result<StockMovement, DomainError> {
         if quantity.is_zero() {
             return Err(DomainError::ZeroQuantity {
                 sku: self.sku.clone(),
@@ -84,17 +89,46 @@ impl Stock {
                 .ok_or_else(|| DomainError::QuantityOverflow {
                     sku: self.sku.clone(),
                 })?;
-        Ok(())
+        Ok(self.movement(i64::from(quantity.value()), MovementReason::Receipt))
+    }
+
+    /// 棚卸調整。帳簿の数を実際の数に合わせる。
+    ///
+    /// 引当済みの数より少なくはできない。
+    /// 引き当てた注文が出荷できなくなるので、先にその注文をどうするか(キャンセルなど)を
+    /// 人が判断すべきだから。自動で引当を外すと、誰の注文が欠けるかが勝手に決まってしまう。
+    #[must_use = "受払台帳に記録すること"]
+    pub fn adjust(
+        &mut self,
+        delta: i64,
+        reason: AdjustmentReason,
+    ) -> Result<StockMovement, DomainError> {
+        if delta == 0 {
+            return Err(DomainError::ZeroQuantity {
+                sku: self.sku.clone(),
+            });
+        }
+        // i64 で計算してから u32 に戻す。`u32::try_from` は範囲外なら Err を返す変換。
+        let new_on_hand = i64::from(self.on_hand.value()) + delta;
+        let new_on_hand = u32::try_from(new_on_hand)
+            .map(Quantity::new)
+            .map_err(|_| self.adjustment_error())?;
+        if new_on_hand < self.reserved {
+            return Err(self.adjustment_error());
+        }
+        self.on_hand = new_on_hand;
+        Ok(self.movement(delta, MovementReason::Adjustment(reason)))
     }
 
     /// 引当。引当可能数が足りなければ何も変えずにエラー。
     pub fn reserve(&mut self, quantity: Quantity) -> Result<(), DomainError> {
-        if let Some(shortage) = self.shortage_for(quantity) {
-            return Err(DomainError::InsufficientStock {
-                shortages: vec![shortage],
+        if self.available() < quantity {
+            return Err(DomainError::ReservedOverflow {
+                warehouse: self.warehouse.clone(),
+                sku: self.sku.clone(),
             });
         }
-        // shortage_for で available >= quantity を確認済みなので、
+        // 上で available >= quantity を確認済みなので、
         // reserved + quantity <= on_hand <= u32::MAX となり、あふれない。
         self.reserved =
             self.reserved
@@ -113,27 +147,55 @@ impl Stock {
 
     /// 出荷。倉庫から物が出ていくので、実在庫と引当済みの両方を減らす。
     /// 両方減らすので available は変わらない。
-    pub fn ship(&mut self, quantity: Quantity) -> Result<(), DomainError> {
+    #[must_use = "受払台帳に記録すること"]
+    pub fn ship(
+        &mut self,
+        quantity: Quantity,
+        reason: MovementReason,
+    ) -> Result<StockMovement, DomainError> {
         // 先に両方の計算を済ませてから代入する。
         // 片方だけ代入した後にもう片方で失敗すると、中途半端な状態が残るため。
         let new_reserved = self.subtract_reserved(quantity)?;
-        let new_on_hand =
-            self.on_hand
-                .checked_sub(quantity)
-                .ok_or_else(|| DomainError::ReservedUnderflow {
-                    sku: self.sku.clone(),
-                })?;
+        let new_on_hand = self
+            .on_hand
+            .checked_sub(quantity)
+            .ok_or_else(|| self.underflow_error())?;
         self.reserved = new_reserved;
         self.on_hand = new_on_hand;
-        Ok(())
+        Ok(self.movement(-i64::from(quantity.value()), reason))
     }
 
     fn subtract_reserved(&self, quantity: Quantity) -> Result<Quantity, DomainError> {
         self.reserved
             .checked_sub(quantity)
-            .ok_or_else(|| DomainError::ReservedUnderflow {
-                sku: self.sku.clone(),
-            })
+            .ok_or_else(|| self.underflow_error())
+    }
+
+    /// 変更後の状態から台帳の 1 行を作る。必ず on_hand を更新した「後」に呼ぶ。
+    fn movement(&self, delta: i64, reason: MovementReason) -> StockMovement {
+        StockMovement {
+            warehouse: self.warehouse.clone(),
+            sku: self.sku.clone(),
+            delta,
+            balance_after: self.on_hand,
+            reason,
+        }
+    }
+
+    fn underflow_error(&self) -> DomainError {
+        DomainError::ReservedUnderflow {
+            warehouse: self.warehouse.clone(),
+            sku: self.sku.clone(),
+        }
+    }
+
+    fn adjustment_error(&self) -> DomainError {
+        DomainError::AdjustmentBelowReserved {
+            warehouse: self.warehouse.clone(),
+            sku: self.sku.clone(),
+            on_hand: self.on_hand,
+            reserved: self.reserved,
+        }
     }
 }
 
@@ -142,9 +204,13 @@ mod tests {
     use super::*;
 
     fn stock(on_hand: u32, reserved: u32) -> Stock {
-        let mut stock = Stock::new(Sku::new("APPLE").unwrap());
+        let mut stock = Stock::new(
+            WarehouseId::new("TOKYO").unwrap(),
+            Sku::new("APPLE").unwrap(),
+        );
         if on_hand > 0 {
-            stock.receive(Quantity::new(on_hand)).unwrap();
+            // テストでは台帳の行は使わないので `let _ =` で明示的に捨てる。
+            let _ = stock.receive(Quantity::new(on_hand)).unwrap();
         }
         if reserved > 0 {
             stock.reserve(Quantity::new(reserved)).unwrap();
@@ -159,10 +225,13 @@ mod tests {
     }
 
     #[test]
-    fn 入荷で実在庫が増える() {
+    fn 入荷で実在庫が増え_台帳の行が返る() {
         let mut stock = stock(10, 0);
-        stock.receive(Quantity::new(5)).unwrap();
+        let movement = stock.receive(Quantity::new(5)).unwrap();
         assert_eq!(stock.on_hand(), Quantity::new(15));
+        assert_eq!(movement.delta, 5);
+        assert_eq!(movement.balance_after, Quantity::new(15));
+        assert_eq!(movement.reason, MovementReason::Receipt);
     }
 
     #[test]
@@ -177,29 +246,49 @@ mod tests {
     fn 引当可能数を超える引当は失敗し在庫は変わらない() {
         let mut stock = stock(5, 3);
         let before = stock.clone();
-
-        let result = stock.reserve(Quantity::new(3));
-
-        assert_eq!(
-            result,
-            Err(DomainError::InsufficientStock {
-                shortages: vec![Shortage {
-                    sku: Sku::new("APPLE").unwrap(),
-                    requested: Quantity::new(3),
-                    available: Quantity::new(2),
-                }]
-            })
-        );
+        assert!(stock.reserve(Quantity::new(3)).is_err());
         assert_eq!(stock, before);
     }
 
     #[test]
-    fn 出荷で実在庫と引当済みが両方減る() {
+    fn 出荷で実在庫と引当済みが両方減り_マイナスの行が返る() {
         let mut stock = stock(10, 4);
-        stock.ship(Quantity::new(4)).unwrap();
+        let movement = stock
+            .ship(Quantity::new(4), MovementReason::Receipt)
+            .unwrap();
         assert_eq!(stock.on_hand(), Quantity::new(6));
         assert_eq!(stock.reserved(), Quantity::ZERO);
-        assert_eq!(stock.available(), Quantity::new(6));
+        assert_eq!(movement.delta, -4);
+        assert_eq!(movement.balance_after, Quantity::new(6));
+    }
+
+    #[test]
+    fn 棚卸調整で増やすことも減らすこともできる() {
+        let mut stock = stock(10, 0);
+        let lost = stock.adjust(-3, AdjustmentReason::Lost).unwrap();
+        assert_eq!(stock.on_hand(), Quantity::new(7));
+        assert_eq!(lost.balance_after, Quantity::new(7));
+
+        let _ = stock.adjust(2, AdjustmentReason::Found).unwrap();
+        assert_eq!(stock.on_hand(), Quantity::new(9));
+    }
+
+    #[test]
+    fn 引当済みを下回る棚卸調整はエラーで在庫は変わらない() {
+        let mut stock = stock(10, 8);
+        let before = stock.clone();
+        let result = stock.adjust(-3, AdjustmentReason::Damaged);
+        assert!(matches!(
+            result,
+            Err(DomainError::AdjustmentBelowReserved { .. })
+        ));
+        assert_eq!(stock, before);
+    }
+
+    #[test]
+    fn 実在庫をマイナスにする棚卸調整はエラー() {
+        let mut stock = stock(2, 0);
+        assert!(stock.adjust(-3, AdjustmentReason::Lost).is_err());
     }
 
     #[test]

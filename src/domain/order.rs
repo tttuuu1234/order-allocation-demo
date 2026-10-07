@@ -1,26 +1,41 @@
 //! 受注と、その状態遷移。
 //!
-//! 状態遷移のルールは `next_status` の 1 か所に集めている。
-//! 遷移表がコードに 1 つだけあれば、ルールの確認も変更もそこを見るだけで済むため。
-//!
 //! ```text
-//!   Pending ──allocate──▶ Allocated ──ship──▶ Shipped
-//!      │                     │
-//!      └──cancel──▶ Cancelled ◀──cancel──┘
+//!              ┌──────── allocate(不足)───────┐
+//!              ▼                               │
+//!   Pending ──allocate(不足)──▶ Backordered ──┘
+//!     │  │                         │
+//!     │  └──allocate(成功)──┐      │ allocate(成功)/ 入荷時の自動再引当
+//!     │                     ▼      ▼
+//!     │                    Allocated ──ship(一部の出荷)──▶ PartiallyShipped
+//!     │                     │   │                              │
+//!     │                     │   └──ship(最後の出荷)──▶ Shipped ◀┘ ship(最後の出荷)
+//!     ▼                     ▼
+//!   Cancelled ◀── cancel ── (Pending / Backordered / Allocated から)
 //! ```
+//!
+//! どの状態からどの操作ができるかは `ensure_can` の 1 か所にまとめている。
+//! 遷移表がコードに 1 つだけあれば、ルールの確認も変更もそこを見るだけで済むため。
 
 use std::fmt;
 
-use super::{DomainError, OrderId, Quantity, Sku};
+use super::{
+    DomainError, OrderId, PlannedAllocation, Quantity, Shipment, ShipmentLine, ShipmentNo, Sku,
+    TrackingNumber, WarehouseId,
+};
 
 /// 受注の状態。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderStatus {
-    /// 受け付けたが、まだ在庫を確保していない
+    /// 受け付けたが、まだ引当を試していない
     Pending,
-    /// 在庫を確保済み(出荷待ち)
+    /// 引当を試したが在庫が足りず、入荷待ち(バックオーダー)。在庫は 1 つも押さえていない
+    Backordered,
+    /// 全明細の在庫を確保済み(出荷待ち)
     Allocated,
-    /// 出荷済み(終端)
+    /// 出荷が複数に分かれ、一部だけ出荷済み
+    PartiallyShipped,
+    /// 全出荷が出荷済み(終端)
     Shipped,
     /// キャンセル済み(終端)
     Cancelled,
@@ -28,13 +43,8 @@ pub enum OrderStatus {
 
 impl fmt::Display for OrderStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            OrderStatus::Pending => "Pending",
-            OrderStatus::Allocated => "Allocated",
-            OrderStatus::Shipped => "Shipped",
-            OrderStatus::Cancelled => "Cancelled",
-        };
-        write!(f, "{name}")
+        // `{:?}` は derive(Debug) の表示。enum ならバリアント名がそのまま出る。
+        write!(f, "{self:?}")
     }
 }
 
@@ -64,12 +74,14 @@ pub struct OrderLine {
     pub quantity: Quantity,
 }
 
-/// 受注。
+/// 受注。出荷(Shipment)を子として持つ集約。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Order {
     id: OrderId,
     lines: Vec<OrderLine>,
     status: OrderStatus,
+    /// 引当時に、倉庫ごとに 1 件ずつ作られる
+    shipments: Vec<Shipment>,
 }
 
 impl Order {
@@ -81,7 +93,6 @@ impl Order {
     ///
     /// 合算するのは、同じ SKU が 2 行あると引当時に
     /// 「1 行目は確保できたが 2 行目で足りない」という判定が複雑になるため。
-    /// 1 SKU = 1 行に正規化しておけば、在庫 1 件と明細 1 件を素直に突き合わせられる。
     ///
     /// 引数の `lines: Vec<OrderLine>` は参照(`&`)ではなく値で受け取っている。
     /// これは「所有権を受け取る」という意味で、呼び出し元はこの後 `lines` を使えなくなる(ムーブ)。
@@ -118,6 +129,7 @@ impl Order {
             id,
             lines: merged,
             status: OrderStatus::Pending,
+            shipments: Vec::new(),
         })
     }
 
@@ -135,164 +147,161 @@ impl Order {
         self.status
     }
 
-    /// 状態遷移表。現在の状態と操作から、遷移先を決める。
+    pub fn shipments(&self) -> &[Shipment] {
+        &self.shipments
+    }
+
+    pub fn contains_sku(&self, sku: &Sku) -> bool {
+        self.lines.iter().any(|line| &line.sku == sku)
+    }
+
+    /// 状態遷移表。現在の状態でその操作が許されるかを判定する。
     ///
-    /// 状態を変えずに「遷移できるか」だけを知りたい場面(引当の事前チェック)があるので、
-    /// 判定と変更を分けている。
-    pub fn next_status(&self, action: OrderAction) -> Result<OrderStatus, DomainError> {
-        // タプル `(状態, 操作)` に対して match すると、遷移表をそのまま書き下せる。
-        // `|` は「または」。`_` は「それ以外すべて」。
-        match (self.status, action) {
-            (OrderStatus::Pending, OrderAction::Allocate) => Ok(OrderStatus::Allocated),
-            (OrderStatus::Allocated, OrderAction::Ship) => Ok(OrderStatus::Shipped),
-            (OrderStatus::Pending | OrderStatus::Allocated, OrderAction::Cancel) => {
-                Ok(OrderStatus::Cancelled)
-            }
-            (from, action) => Err(DomainError::InvalidTransition {
+    /// 遷移先は操作ごとのメソッドが決める(出荷は「残りの出荷があるか」で行き先が変わるため)。
+    /// ここは「許されるか」だけに集中させて、表として読めるようにしている。
+    pub fn ensure_can(&self, action: OrderAction) -> Result<(), DomainError> {
+        use OrderStatus::*; // この関数の中だけ `OrderStatus::` を省略して書けるようにする
+
+        // `matches!(値, パターン)` は値がパターンに一致するかを bool で返す。
+        // `|` は「または」。
+        let allowed = match action {
+            OrderAction::Allocate => matches!(self.status, Pending | Backordered),
+            OrderAction::Ship => matches!(self.status, Allocated | PartiallyShipped),
+            // 一部でも出荷したら取り消せない。物はもう倉庫を出ているので、
+            // 実務では「キャンセル」ではなく「返品」という別の業務になる。
+            OrderAction::Cancel => matches!(self.status, Pending | Backordered | Allocated),
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(DomainError::InvalidTransition {
                 order_id: self.id,
-                from,
+                from: self.status,
                 action,
-            }),
+            })
         }
     }
 
-    /// 引当済みにする。在庫の確保は `domain::allocate` が担う。
-    pub fn allocate(&mut self) -> Result<(), DomainError> {
-        self.transition(OrderAction::Allocate)
-    }
+    /// 引当計画を受け取り、倉庫ごとの出荷を作って Allocated にする。
+    /// 在庫の確保は `domain::allocate` が担う。
+    pub fn allocate(&mut self, plan: Vec<PlannedAllocation>) -> Result<(), DomainError> {
+        self.ensure_can(OrderAction::Allocate)?;
+        self.ensure_plan_covers_lines(&plan)?;
 
-    /// 出荷済みにする。在庫の減算は `domain::ship` が担う。
-    pub fn ship(&mut self) -> Result<(), DomainError> {
-        self.transition(OrderAction::Ship)
-    }
+        // 倉庫ごとにまとめる。倉庫の並びは計画に最初に出てきた順(= 戦略の優先順)。
+        let mut groups: Vec<(WarehouseId, Vec<ShipmentLine>)> = Vec::new();
+        for item in plan {
+            let line = ShipmentLine {
+                sku: item.sku,
+                quantity: item.quantity,
+            };
+            // `position` は条件に合う最初の要素の添字を Option で返す。
+            match groups.iter().position(|(w, _)| *w == item.warehouse) {
+                Some(index) => groups[index].1.push(line),
+                None => groups.push((item.warehouse, vec![line])),
+            }
+        }
 
-    /// キャンセル済みにする。引当の解放は `domain::cancel` が担う。
-    pub fn cancel(&mut self) -> Result<(), DomainError> {
-        self.transition(OrderAction::Cancel)
-    }
-
-    fn transition(&mut self, action: OrderAction) -> Result<(), DomainError> {
-        self.status = self.next_status(action)?;
+        // `enumerate` は (添字, 要素) の組を順に返す。出荷番号は 1 から振る。
+        self.shipments = groups
+            .into_iter()
+            .enumerate()
+            .map(|(index, (warehouse, lines))| {
+                Shipment::new(ShipmentNo::new(index as u32 + 1), warehouse, lines)
+            })
+            .collect();
+        self.status = OrderStatus::Allocated;
         Ok(())
+    }
+
+    /// 入荷待ちにする。在庫は何も押さえない。
+    pub fn backorder(&mut self) -> Result<(), DomainError> {
+        // 引当を試した結果として入るので、引当と同じ遷移条件を使う。
+        self.ensure_can(OrderAction::Allocate)?;
+        self.status = OrderStatus::Backordered;
+        Ok(())
+    }
+
+    /// 出荷を 1 件、出荷済みにする。在庫の減算は `domain::ship` が担う。
+    ///
+    /// 戻り値は出荷済みにした出荷の複製(在庫をどこからいくつ減らすかに使う)。
+    pub fn ship(
+        &mut self,
+        no: ShipmentNo,
+        tracking_number: TrackingNumber,
+    ) -> Result<Shipment, DomainError> {
+        self.ensure_can(OrderAction::Ship)?;
+
+        let order_id = self.id;
+        let shipment = self.shipments.iter_mut().find(|s| s.no() == no).ok_or(
+            DomainError::ShipmentNotFound {
+                order_id,
+                shipment_no: no,
+            },
+        )?;
+        if !shipment.is_awaiting() {
+            return Err(DomainError::ShipmentAlreadyShipped {
+                order_id,
+                shipment_no: no,
+            });
+        }
+        shipment.mark_shipped(tracking_number);
+        let shipped = shipment.clone();
+
+        // 全部の出荷が終わったかで、注文の行き先が変わる。
+        let all_shipped = self.shipments.iter().all(|s| !s.is_awaiting());
+        self.status = if all_shipped {
+            OrderStatus::Shipped
+        } else {
+            OrderStatus::PartiallyShipped
+        };
+        Ok(shipped)
+    }
+
+    /// キャンセルする。引当の解放は `domain::cancel` が担う。
+    ///
+    /// 戻り値は、この注文が押さえていた在庫(倉庫, 明細)の一覧。
+    /// `(A, B)` はタプルで、名前の無い組を手軽に返したいときに使う。
+    pub fn cancel(&mut self) -> Result<Vec<(WarehouseId, ShipmentLine)>, DomainError> {
+        self.ensure_can(OrderAction::Cancel)?;
+
+        let mut released = Vec::new();
+        for shipment in &mut self.shipments {
+            if shipment.is_awaiting() {
+                for line in shipment.lines() {
+                    released.push((shipment.warehouse().clone(), line.clone()));
+                }
+                shipment.mark_cancelled();
+            }
+        }
+        self.status = OrderStatus::Cancelled;
+        Ok(released)
+    }
+
+    /// 計画の数量が、SKU ごとに明細の数量とぴったり一致するか。
+    ///
+    /// 戦略が正しければ必ず一致する。一致しなければ戦略のバグなので、
+    /// 少なすぎる・多すぎる引当を黙って受け入れないよう、ここで止める。
+    fn ensure_plan_covers_lines(&self, plan: &[PlannedAllocation]) -> Result<(), DomainError> {
+        let planned_total = |sku: &Sku| {
+            plan.iter()
+                .filter(|p| &p.sku == sku)
+                .map(|p| u64::from(p.quantity.value()))
+                .sum::<u64>()
+        };
+        let covers_every_line = self
+            .lines
+            .iter()
+            .all(|line| planned_total(&line.sku) == u64::from(line.quantity.value()));
+        let has_extra_sku = plan.iter().any(|p| !self.contains_sku(&p.sku));
+
+        if covers_every_line && !has_extra_sku {
+            Ok(())
+        } else {
+            Err(DomainError::PlanMismatch { order_id: self.id })
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn line(sku: &str, quantity: u32) -> OrderLine {
-        OrderLine {
-            sku: Sku::new(sku).unwrap(),
-            quantity: Quantity::new(quantity),
-        }
-    }
-
-    fn pending_order() -> Order {
-        Order::new(OrderId::new(1), vec![line("APPLE", 1)]).unwrap()
-    }
-
-    #[test]
-    fn 同一_sku_の明細は合算され順序は保たれる() {
-        let order = Order::new(
-            OrderId::new(1),
-            vec![line("APPLE", 2), line("BANANA", 1), line("APPLE", 3)],
-        )
-        .unwrap();
-
-        assert_eq!(order.lines(), &[line("APPLE", 5), line("BANANA", 1)]);
-    }
-
-    #[test]
-    fn 明細が空の注文はエラー() {
-        let result = Order::new(OrderId::new(1), vec![]);
-        assert_eq!(result, Err(DomainError::EmptyOrderLines));
-    }
-
-    #[test]
-    fn 数量0の明細はエラー() {
-        let result = Order::new(OrderId::new(1), vec![line("APPLE", 1), line("BANANA", 0)]);
-        assert!(
-            matches!(result, Err(DomainError::ZeroQuantity { sku }) if sku.as_str() == "BANANA")
-        );
-    }
-
-    #[test]
-    fn 新しい注文は_pending() {
-        assert_eq!(pending_order().status(), OrderStatus::Pending);
-    }
-
-    #[test]
-    fn pending_から引当_出荷と進める() {
-        let mut order = pending_order();
-        order.allocate().unwrap();
-        assert_eq!(order.status(), OrderStatus::Allocated);
-        order.ship().unwrap();
-        assert_eq!(order.status(), OrderStatus::Shipped);
-    }
-
-    #[test]
-    fn pending_も_allocated_もキャンセルできる() {
-        let mut pending = pending_order();
-        pending.cancel().unwrap();
-        assert_eq!(pending.status(), OrderStatus::Cancelled);
-
-        let mut allocated = pending_order();
-        allocated.allocate().unwrap();
-        allocated.cancel().unwrap();
-        assert_eq!(allocated.status(), OrderStatus::Cancelled);
-    }
-
-    #[test]
-    fn pending_のまま出荷はできない() {
-        let mut order = pending_order();
-        let result = order.ship();
-        assert_eq!(
-            result,
-            Err(DomainError::InvalidTransition {
-                order_id: OrderId::new(1),
-                from: OrderStatus::Pending,
-                action: OrderAction::Ship,
-            })
-        );
-        // 失敗した遷移で状態が変わっていないこと
-        assert_eq!(order.status(), OrderStatus::Pending);
-    }
-
-    #[test]
-    fn shipped_はキャンセルできない() {
-        let mut order = pending_order();
-        order.allocate().unwrap();
-        order.ship().unwrap();
-        let result = order.cancel();
-        assert!(matches!(
-            result,
-            Err(DomainError::InvalidTransition {
-                from: OrderStatus::Shipped,
-                action: OrderAction::Cancel,
-                ..
-            })
-        ));
-        assert_eq!(order.status(), OrderStatus::Shipped);
-    }
-
-    #[test]
-    fn 二重引当はできない() {
-        let mut order = pending_order();
-        order.allocate().unwrap();
-        assert!(order.allocate().is_err());
-    }
-
-    #[test]
-    fn cancelled_からはどこにも遷移できない() {
-        for action in [
-            OrderAction::Allocate,
-            OrderAction::Ship,
-            OrderAction::Cancel,
-        ] {
-            let mut order = pending_order();
-            order.cancel().unwrap();
-            assert!(order.next_status(action).is_err(), "{action} should fail");
-        }
-    }
-}
+mod tests;

@@ -1,254 +1,151 @@
-//! 受注と在庫をまたぐ操作(引当・出荷・キャンセル)。
+//! 受注と在庫をまたぐ操作(引当・出荷・キャンセル・入荷待ちの再引当)。
 //!
 //! Order と Stock のどちらか一方のメソッドにすると、
 //! もう一方の内部を知る必要が出てくるので、両者を受け取る関数として独立させている。
 //! (DDD でいう「ドメインサービス」にあたる)
 //!
-//! どの関数も「失敗したら order も stocks も一切変えない」ことを保証する。
+//! どの関数も「コピーで計算 → 全部成功したら最後に書き戻す」形で書いている。
+//! 途中で失敗しても、引数の order と stocks には何も反映されない。
 //! サービス層もコピーに対して操作するので二重の守りになるが、
 //! ドメイン単体で正しいことをテストで確かめられるようにしておきたいため。
 
-use super::{DomainError, Order, OrderAction, OrderStatus, Shortage, Sku, Stock};
+use super::{
+    AllocationStrategy, DomainError, MovementReason, Order, OrderAction, OrderId, OrderStatus,
+    ShipmentNo, Shortage, Sku, Stock, StockMovement, TrackingNumber, WarehouseId,
+};
 
-/// 引当。全明細を確保できるときだけ確保し、1 つでも足りなければ何も変えない(all-or-nothing)。
+/// 引当の結果。
 ///
-/// `stocks` には注文の全 SKU の在庫が含まれている前提。
-pub fn allocate(order: &mut Order, stocks: &mut [Stock]) -> Result<(), DomainError> {
-    // 1. 状態遷移できるかを先に確認する。
-    //    在庫不足より先に調べるのは、出荷済みの注文に「在庫不足」と返すと誤解を招くため。
-    order.next_status(OrderAction::Allocate)?;
-
-    // 2. まだ何も変えずに、全明細の不足を集める。
-    //    途中で return せず最後まで調べるのは、不足を一括で返すという業務ルールのため。
-    let mut shortages: Vec<Shortage> = Vec::new();
-    for line in order.lines() {
-        let stock = find_stock(stocks, &line.sku)?;
-        if let Some(shortage) = stock.shortage_for(line.quantity) {
-            shortages.push(shortage);
-        }
-    }
-    if !shortages.is_empty() {
-        return Err(DomainError::InsufficientStock { shortages });
-    }
-
-    // 3. ここに来たら全明細が確保できることが分かっているので、実際に変更する。
-    //    明細は SKU ごとに合算済み(Order::new)なので、同じ在庫を二重に引き当てることはない。
-    //    理屈の上ではもう失敗しないが、ship / cancel と同じく
-    //    「コピーで計算 → 最後に書き戻す」形にして、万一の途中失敗でも引数を汚さない。
-    let mut updated: Vec<Stock> = stocks.to_vec();
-    for line in order.lines() {
-        find_stock_mut(&mut updated, &line.sku)?.reserve(line.quantity)?;
-    }
-    stocks.clone_from_slice(&updated);
-    order.allocate()
+/// 在庫不足はエラーではなく「入荷待ちになった」という正常な結果として返す。
+/// 実務では在庫切れは日常的に起きることで、注文を断るのではなく待たせるのが普通だから。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AllocationOutcome {
+    Allocated,
+    Backordered { shortages: Vec<Shortage> },
 }
 
-/// 出荷。引当済みの数量を、実在庫と引当済みの両方から減らす。
-pub fn ship(order: &mut Order, stocks: &mut [Stock]) -> Result<(), DomainError> {
-    order.next_status(OrderAction::Ship)?;
+/// 引当。全明細を確保できるときだけ確保し、1 つでも足りなければ在庫には一切触れず
+/// 入荷待ち(Backordered)にする(注文単位の all-or-nothing)。
+///
+/// `stocks` には注文の全 SKU について、全倉庫の在庫が含まれている前提。
+/// `strategy: &dyn AllocationStrategy` は「AllocationStrategy を実装した何か」への参照。
+/// 具体的な型は実行時に決まる(動的ディスパッチ。Swift の `any Protocol` にあたる)。
+pub fn allocate(
+    order: &mut Order,
+    stocks: &mut [Stock],
+    strategy: &dyn AllocationStrategy,
+) -> Result<AllocationOutcome, DomainError> {
+    // 状態遷移できるかを先に確認する。
+    // 在庫不足より先に調べるのは、出荷済みの注文に「在庫不足」と返すと誤解を招くため。
+    order.ensure_can(OrderAction::Allocate)?;
 
-    // 各在庫の変更は「コピー(`to_vec`)で計算 → 最後にまとめて書き戻す」形にする。
-    // 途中の明細で失敗しても、引数の stocks には何も反映されていない状態を保つため。
-    let mut updated: Vec<Stock> = stocks.to_vec();
-    for line in order.lines() {
-        find_stock_mut(&mut updated, &line.sku)?.ship(line.quantity)?;
+    let plan = match strategy.plan(order.lines(), stocks) {
+        Ok(plan) => plan,
+        Err(shortages) => {
+            order.backorder()?;
+            return Ok(AllocationOutcome::Backordered { shortages });
+        }
+    };
+
+    let mut updated_order = order.clone();
+    let mut updated_stocks = stocks.to_vec();
+    for item in &plan {
+        find_stock_mut(&mut updated_stocks, &item.warehouse, &item.sku)?.reserve(item.quantity)?;
     }
+    updated_order.allocate(plan)?;
 
+    // ここまで来たら全部成功。まとめて書き戻す。
+    // `*order = ...` は参照の先にある値そのものを置き換える(`*` は参照外し)。
+    *order = updated_order;
     // `clone_from_slice` は長さが同じスライスへ中身をまとめて複製する。
-    stocks.clone_from_slice(&updated);
-    order.ship()
+    stocks.clone_from_slice(&updated_stocks);
+    Ok(AllocationOutcome::Allocated)
 }
 
-/// キャンセル。引当済みなら引当を解放する。
-pub fn cancel(order: &mut Order, stocks: &mut [Stock]) -> Result<(), DomainError> {
-    order.next_status(OrderAction::Cancel)?;
+/// 出荷を 1 件出す。その出荷の倉庫の在庫から、実在庫と引当済みの両方を減らす。
+///
+/// 戻り値は受払台帳に記録する在庫の動き。
+pub fn ship(
+    order: &mut Order,
+    shipment_no: ShipmentNo,
+    tracking_number: TrackingNumber,
+    stocks: &mut [Stock],
+) -> Result<Vec<StockMovement>, DomainError> {
+    let mut updated_order = order.clone();
+    let shipment = updated_order.ship(shipment_no, tracking_number)?;
 
-    // Pending のキャンセルは在庫に触れない。まだ何も確保していないから。
-    // 状態を見て分岐するのはここだけにし、Order 側には在庫の知識を持たせない。
-    let was_allocated = order.status() == OrderStatus::Allocated;
-    if was_allocated {
-        let mut updated: Vec<Stock> = stocks.to_vec();
-        for line in order.lines() {
-            find_stock_mut(&mut updated, &line.sku)?.release(line.quantity)?;
-        }
-        stocks.clone_from_slice(&updated);
+    let mut updated_stocks = stocks.to_vec();
+    let mut movements = Vec::new();
+    for line in shipment.lines() {
+        let reason = MovementReason::Shipment {
+            order_id: order.id(),
+            shipment_no,
+        };
+        let stock = find_stock_mut(&mut updated_stocks, shipment.warehouse(), &line.sku)?;
+        movements.push(stock.ship(line.quantity, reason)?);
     }
-    order.cancel()
+
+    *order = updated_order;
+    stocks.clone_from_slice(&updated_stocks);
+    Ok(movements)
 }
 
-fn find_stock<'a>(stocks: &'a [Stock], sku: &Sku) -> Result<&'a Stock, DomainError> {
+/// キャンセル。まだ出荷していない出荷が押さえていた在庫を解放する。
+pub fn cancel(order: &mut Order, stocks: &mut [Stock]) -> Result<(), DomainError> {
+    let mut updated_order = order.clone();
+    // Pending / Backordered なら解放するものは無く、空の一覧が返る。
+    let released = updated_order.cancel()?;
+
+    let mut updated_stocks = stocks.to_vec();
+    for (warehouse, line) in &released {
+        find_stock_mut(&mut updated_stocks, warehouse, &line.sku)?.release(line.quantity)?;
+    }
+
+    *order = updated_order;
+    stocks.clone_from_slice(&updated_stocks);
+    Ok(())
+}
+
+/// 入荷待ちの注文を、渡された順に引き当て直す。引当できた注文の ID を返す。
+///
+/// 入荷・棚卸での増加・キャンセルで「引当可能数が増えた」ときに呼ぶ。
+/// 渡す順番がそのまま優先順位になる(サービス層では注文 ID 順 = 先着順で渡している)。
+///
+/// 1 件ずつ all-or-nothing で試すので、先の注文が足りずに待ちのままでも、
+/// 後ろの小さな注文は引当できることがある(追い越し。README のトレードオフ参照)。
+pub fn reallocate_backorders(
+    orders: &mut [Order],
+    stocks: &mut [Stock],
+    strategy: &dyn AllocationStrategy,
+) -> Result<Vec<OrderId>, DomainError> {
+    let mut allocated = Vec::new();
+    for order in orders.iter_mut() {
+        if order.status() != OrderStatus::Backordered {
+            continue;
+        }
+        // 1 件ごとに stocks が更新されるので、次の注文は前の注文が確保した後の在庫で判定される。
+        if allocate(order, stocks, strategy)? == AllocationOutcome::Allocated {
+            allocated.push(order.id());
+        }
+    }
+    Ok(allocated)
+}
+
+fn find_stock_mut<'a>(
+    stocks: &'a mut [Stock],
+    warehouse: &WarehouseId,
+    sku: &Sku,
+) -> Result<&'a mut Stock, DomainError> {
     // `'a` はライフタイム注釈。「戻り値の参照は引数 stocks と同じだけ生きる」ことを
     // コンパイラに伝えている。参照を返す関数で、元データが先に消える事故を防ぐ仕組み。
     stocks
-        .iter()
-        .find(|stock| stock.sku() == sku)
-        .ok_or_else(|| DomainError::StockMissing { sku: sku.clone() })
-}
-
-fn find_stock_mut<'a>(stocks: &'a mut [Stock], sku: &Sku) -> Result<&'a mut Stock, DomainError> {
-    stocks
         .iter_mut()
-        .find(|stock| stock.sku() == sku)
-        .ok_or_else(|| DomainError::StockMissing { sku: sku.clone() })
+        .find(|stock| stock.is(warehouse, sku))
+        .ok_or_else(|| DomainError::StockMissing {
+            warehouse: warehouse.clone(),
+            sku: sku.clone(),
+        })
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::domain::{OrderId, OrderLine, Quantity};
-
-    fn sku(value: &str) -> Sku {
-        Sku::new(value).unwrap()
-    }
-
-    fn stock(value: &str, on_hand: u32) -> Stock {
-        let mut stock = Stock::new(sku(value));
-        stock.receive(Quantity::new(on_hand)).unwrap();
-        stock
-    }
-
-    fn order(lines: &[(&str, u32)]) -> Order {
-        let lines = lines
-            .iter()
-            .map(|(s, q)| OrderLine {
-                sku: sku(s),
-                quantity: Quantity::new(*q),
-            })
-            .collect();
-        Order::new(OrderId::new(1), lines).unwrap()
-    }
-
-    #[test]
-    fn 全明細が確保できれば引当される() {
-        let mut order = order(&[("APPLE", 3), ("BANANA", 2)]);
-        let mut stocks = vec![stock("APPLE", 10), stock("BANANA", 2)];
-
-        allocate(&mut order, &mut stocks).unwrap();
-
-        assert_eq!(order.status(), OrderStatus::Allocated);
-        assert_eq!(stocks[0].reserved(), Quantity::new(3));
-        assert_eq!(stocks[1].reserved(), Quantity::new(2));
-        assert_eq!(stocks[1].available(), Quantity::ZERO);
-    }
-
-    #[test]
-    fn 一部でも不足すれば何も変わらず_不足は全明細ぶん返る() {
-        let mut order = order(&[("APPLE", 3), ("BANANA", 5), ("CHERRY", 9)]);
-        let mut stocks = vec![stock("APPLE", 10), stock("BANANA", 2), stock("CHERRY", 1)];
-        let order_before = order.clone();
-        let stocks_before = stocks.clone();
-
-        let result = allocate(&mut order, &mut stocks);
-
-        // APPLE は足りているので含まれず、BANANA と CHERRY の不足が両方返る
-        assert_eq!(
-            result,
-            Err(DomainError::InsufficientStock {
-                shortages: vec![
-                    Shortage {
-                        sku: sku("BANANA"),
-                        requested: Quantity::new(5),
-                        available: Quantity::new(2),
-                    },
-                    Shortage {
-                        sku: sku("CHERRY"),
-                        requested: Quantity::new(9),
-                        available: Quantity::new(1),
-                    },
-                ]
-            })
-        );
-        // 足りていた APPLE も含め、在庫も注文も一切変わっていない
-        assert_eq!(order, order_before);
-        assert_eq!(stocks, stocks_before);
-    }
-
-    #[test]
-    fn 引当済みの注文を再度引き当てると状態エラーで在庫は変わらない() {
-        let mut order = order(&[("APPLE", 3)]);
-        let mut stocks = vec![stock("APPLE", 10)];
-        allocate(&mut order, &mut stocks).unwrap();
-        let stocks_before = stocks.clone();
-
-        let result = allocate(&mut order, &mut stocks);
-
-        assert!(matches!(result, Err(DomainError::InvalidTransition { .. })));
-        assert_eq!(stocks, stocks_before);
-    }
-
-    #[test]
-    fn 出荷で実在庫と引当済みが減る() {
-        let mut order = order(&[("APPLE", 3)]);
-        let mut stocks = vec![stock("APPLE", 10)];
-        allocate(&mut order, &mut stocks).unwrap();
-
-        ship(&mut order, &mut stocks).unwrap();
-
-        assert_eq!(order.status(), OrderStatus::Shipped);
-        assert_eq!(stocks[0].on_hand(), Quantity::new(7));
-        assert_eq!(stocks[0].reserved(), Quantity::ZERO);
-    }
-
-    #[test]
-    fn 引当前の出荷は状態エラーで在庫は変わらない() {
-        let mut order = order(&[("APPLE", 3)]);
-        let mut stocks = vec![stock("APPLE", 10)];
-
-        let result = ship(&mut order, &mut stocks);
-
-        assert!(matches!(
-            result,
-            Err(DomainError::InvalidTransition {
-                from: OrderStatus::Pending,
-                ..
-            })
-        ));
-        assert_eq!(stocks[0].on_hand(), Quantity::new(10));
-    }
-
-    #[test]
-    fn 引当済みのキャンセルは引当を解放する() {
-        let mut order = order(&[("APPLE", 3)]);
-        let mut stocks = vec![stock("APPLE", 10)];
-        allocate(&mut order, &mut stocks).unwrap();
-
-        cancel(&mut order, &mut stocks).unwrap();
-
-        assert_eq!(order.status(), OrderStatus::Cancelled);
-        assert_eq!(stocks[0].reserved(), Quantity::ZERO);
-        assert_eq!(stocks[0].available(), Quantity::new(10));
-    }
-
-    #[test]
-    fn 未引当のキャンセルは在庫に触れない() {
-        let mut order = order(&[("APPLE", 3)]);
-        let mut stocks = vec![stock("APPLE", 10)];
-        let stocks_before = stocks.clone();
-
-        cancel(&mut order, &mut stocks).unwrap();
-
-        assert_eq!(order.status(), OrderStatus::Cancelled);
-        assert_eq!(stocks, stocks_before);
-    }
-
-    #[test]
-    fn 出荷済みはキャンセルできず在庫も変わらない() {
-        let mut order = order(&[("APPLE", 3)]);
-        let mut stocks = vec![stock("APPLE", 10)];
-        allocate(&mut order, &mut stocks).unwrap();
-        ship(&mut order, &mut stocks).unwrap();
-        let stocks_before = stocks.clone();
-
-        let result = cancel(&mut order, &mut stocks);
-
-        assert!(matches!(
-            result,
-            Err(DomainError::InvalidTransition {
-                from: OrderStatus::Shipped,
-                ..
-            })
-        ));
-        assert_eq!(order.status(), OrderStatus::Shipped);
-        assert_eq!(stocks, stocks_before);
-    }
-}
+mod tests;

@@ -53,6 +53,34 @@ impl fmt::Display for Sku {
     }
 }
 
+/// 倉庫の識別子(例: "TOKYO")。
+///
+/// Sku と同じく String の newtype。中身が同じ String でも型が違うので、
+/// `Stock::new(sku, warehouse)` のように引数の順番を間違えるとコンパイルエラーになる。
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WarehouseId(String);
+
+impl WarehouseId {
+    pub fn new(value: impl Into<String>) -> Result<Self, DomainError> {
+        let value = value.into();
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(DomainError::EmptyWarehouseId);
+        }
+        Ok(WarehouseId(trimmed.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for WarehouseId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// 数量。在庫数・注文数の両方に使う。
 ///
 /// `u32` を選んだのは、負の在庫を型レベルで表現できなくするため。
